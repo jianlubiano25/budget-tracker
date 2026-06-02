@@ -37,6 +37,7 @@ const fmt2=n=>'₱'+Number(n).toLocaleString('en-PH',{minimumFractionDigits:2,ma
 const fmt3=n=>'₱'+Number(n).toLocaleString('en-PH',{minimumFractionDigits:0,maximumFractionDigits:3});
 const stockCatFromHome=cat=>cat==='Cleaning Supplies'?'Cleaning':cat==='Laundry'?'Cleaning':cat==='Toiletries & Personal Care'?'Toiletries':cat==='Medicine & First Aid'?'Medicine':cat==='Kitchen Supplies'?'Kitchen':'Others';
 const isGroceryTx=t=>t?.source==='Groceries';
+const isHomeCookedTx=t=>t?.source==='Home-cooked';
 const stockFromHome=(item,id=uid())=>({id,name:item.name,category:stockCatFromHome(item.category),quantity:parseFloat(item.qty)||1,unit:item.unit||'pcs',minQty:0,note:[item.store,item.note].filter(Boolean).join(' · ')});
 const groceryName=tx=>String(tx.stockName||tx.note||'Groceries').split(' · ')[0].trim()||'Groceries';
 const stockCatFromFood=subcat=>subcat==='Condiments & Sauces'?'Condiments':'Food Staples';
@@ -191,6 +192,46 @@ function applianceSessionEstimate(appliance,minutes,rate=S?.data?.meralcoRate||1
   const kwh=watts*qty*(mins/60)/1000;
   return{kwh,cost:kwh*rate};
 }
+function auditDateTime(date,time,endOfDay=false){
+  if(!date)return null;
+  const t=time|| (endOfDay?'23:59':'00:00');
+  const dt=new Date(`${date}T${t}:00`);
+  return isNaN(dt)?null:dt;
+}
+function usageDateRange(u,start,end){
+  const hasTime=u.start&&u.end;
+  if(hasTime){
+    const s=auditDateTime(u.date,u.start),e=auditDateTime(u.date,u.end);
+    if(!s||!e)return null;
+    if(e<=s)e.setDate(e.getDate()+1);
+    return{s,e,exact:true};
+  }
+  const s=auditDateTime(u.date,'00:00'),e=auditDateTime(u.date,'23:59');
+  return s&&e?{s,e,exact:false}:null;
+}
+function overlapsRange(s,e,start,end){return s<end&&e>start;}
+function meterAudit(data=S?.data,f=S?.auditF){
+  const start=auditDateTime(f?.startDate,f?.startTime),end=auditDateTime(f?.endDate,f?.endTime);
+  const startRead=parseFloat(f?.startRead),endRead=parseFloat(f?.endRead),rate=parseFloat(data?.meralcoRate)||14.3345;
+  if(!start||!end||end<=start)return{valid:false,error:'Enter a valid start and end time.'};
+  const meterKwh=!isNaN(startRead)&&!isNaN(endRead)?endRead-startRead:0;
+  const hours=(end-start)/36e5;
+  const include=(u)=>{const r=usageDateRange(u,start,end);return r&&overlapsRange(r.s,r.e,start,end);};
+  const aircon=(data?.airconUsage||[]).filter(include);
+  const tv=(data?.tvUsage||[]).filter(include);
+  const appliances=(data?.applianceUsage||[]).filter(include);
+  const sum=rows=>rows.reduce((s,u)=>s+(parseFloat(u.kwh)||0),0);
+  const airconKwh=sum(aircon),tvKwh=sum(tv),sessionKwh=sum(appliances);
+  const alwaysRows=(data?.appliances||[]).filter(a=>a.alwaysOn).map(a=>{
+    const watts=parseFloat(a.watts)||0,qty=parseFloat(a.qty)||1,kwh=watts*qty*hours/1000;
+    return{...a,kwh,cost:kwh*rate};
+  });
+  const alwaysKwh=alwaysRows.reduce((s,a)=>s+a.kwh,0);
+  const loggedKwh=airconKwh+tvKwh+sessionKwh,estimatedKwh=loggedKwh+alwaysKwh;
+  const gap=meterKwh?meterKwh-estimatedKwh:0;
+  const matchPct=meterKwh>0?estimatedKwh/meterKwh*100:0;
+  return{valid:true,start,end,hours,meterKwh,aircon,tv,appliances,alwaysRows,airconKwh,tvKwh,sessionKwh,alwaysKwh,loggedKwh,estimatedKwh,gap,matchPct,rate};
+}
 function applianceSessionDraft(appliance,date=toStr()){
   const mins=parseFloat(appliance?.sessionMinutes)||60,start=timeOf(new Date());
   return{applianceId:appliance?.id||'',date,start,end:timePlus(start,mins),minutes:String(mins)};
@@ -257,24 +298,42 @@ function mealsDailyChart(monthKey=curMk(),data=S?.data){
   });
 }
 function electricityComparisonForMonth(monthKey,data=S?.data,actualKwh=0){
-  const readDay=meralcoReadDay(data),[y,m]=monthKey.split('-').map(Number),last=daysInMonth(y,m-1);
-  const candidates=[
-    billCycleForMonth(monthKey,readDay),
-    cycleForDate(`${monthKey}-01`,readDay),
-    cycleForDate(`${monthKey}-${pad2(last)}`,readDay),
-    cycleForDate(`${monthKey}-${pad2(Math.min(readDay,last))}`,readDay)
-  ];
-  [...(data?.airconUsage||[]),...(data?.tvUsage||[]),...(data?.applianceUsage||[])].forEach(u=>{
-    const c=cycleForDate(u.date,readDay),startMk=mk(dateOf(c.start)),endMk=mk(dateOf(c.end));
-    if(startMk===monthKey||endMk===monthKey||billMonthFromCycle(c)===monthKey)candidates.push(c);
+  const cycle=billCycleForMonth(monthKey,meralcoReadDay(data));
+  const est=electricityCycleEstimate(cycle,data);
+  const loggedKwh=est.airconKwh+est.tvKwh+est.sessionKwh;
+  return{cycle,est,loggedKwh,diff:actualKwh?Math.abs(est.totalKwh-actualKwh):0};
+}
+function electricityReportForMonth(monthKey=curMk(),data=S?.data){
+  const rate=parseFloat(data?.meralcoRate)||14.3345;
+  const aircon=(data?.airconUsage||[]).filter(u=>mk(u.date)===monthKey);
+  const tv=(data?.tvUsage||[]).filter(u=>mk(u.date)===monthKey);
+  const sessions=(data?.applianceUsage||[]).filter(u=>mk(u.date)===monthKey);
+  const always=(data?.appliances||[]).filter(a=>a.alwaysOn).map(a=>{
+    const est=applianceMonthly(a,rate);
+    return{name:a.name,category:a.category||'24/7',kwh:est.kwh,cost:est.cost,hours:720,logs:0,type:'24/7'};
   });
-  const uniq=[...new Map(candidates.map(c=>[c.key,c])).values()];
-  const scored=uniq.map(c=>{
-    const est=electricityCycleEstimate(c,data),loggedKwh=est.airconKwh+est.tvKwh+est.sessionKwh;
-    return{cycle:c,est,loggedKwh,diff:actualKwh?Math.abs(est.totalKwh-actualKwh):0};
+  const airconKwh=aircon.reduce((s,u)=>s+(parseFloat(u.kwh)||0),0),airconCost=aircon.reduce((s,u)=>s+(parseFloat(u.cost)||0),0),airconHours=aircon.reduce((s,u)=>s+(parseFloat(u.hours)||parseFloat(u.minutes)/60||0),0);
+  const tvKwh=tv.reduce((s,u)=>s+(parseFloat(u.kwh)||0),0),tvCost=tv.reduce((s,u)=>s+(parseFloat(u.cost)||0),0),tvHours=tv.reduce((s,u)=>s+(parseFloat(u.hours)||parseFloat(u.minutes)/60||0),0);
+  const sessionKwh=sessions.reduce((s,u)=>s+(parseFloat(u.kwh)||0),0),sessionCost=sessions.reduce((s,u)=>s+(parseFloat(u.cost)||0),0),sessionHours=sessions.reduce((s,u)=>s+(parseFloat(u.hours)||parseFloat(u.minutes)/60||0),0);
+  const alwaysKwh=always.reduce((s,u)=>s+u.kwh,0),alwaysCost=always.reduce((s,u)=>s+u.cost,0);
+  const applianceGroups=new Map();
+  sessions.forEach(u=>{
+    const key=u.name||'Appliance',g=applianceGroups.get(key)||{name:key,category:u.category||'Appliance',kwh:0,cost:0,hours:0,logs:0,type:'Appliance'};
+    g.kwh+=parseFloat(u.kwh)||0;g.cost+=parseFloat(u.cost)||0;g.hours+=parseFloat(u.hours)||parseFloat(u.minutes)/60||0;g.logs+=1;applianceGroups.set(key,g);
   });
-  scored.sort((a,b)=>(b.loggedKwh>0)-(a.loggedKwh>0)||(actualKwh?a.diff-b.diff:0)||b.cycle.key.localeCompare(a.cycle.key));
-  return scored[0]||{cycle:billCycleForMonth(monthKey,readDay),est:electricityCycleEstimate(billCycleForMonth(monthKey,readDay),data),loggedKwh:0,diff:0};
+  const top=[
+    ...(airconKwh?[{name:'Aircon',category:'Cooling',kwh:airconKwh,cost:airconCost,hours:airconHours,logs:aircon.length,type:'Aircon'}]:[]),
+    ...(tvKwh?[{name:'TV',category:'TV',kwh:tvKwh,cost:tvCost,hours:tvHours,logs:tv.length,type:'TV'}]:[]),
+    ...always,
+    ...applianceGroups.values()
+  ].sort((a,b)=>b.kwh-a.kwh);
+  const logs=[
+    ...aircon.map(u=>({type:'Aircon',name:`${airconModeLabel(u.mode,u.sleepMode)} · ${durationLabel(u.minutes||(u.hours||0)*60)}`,date:u.date,time:u.start&&u.end?`${fmtTime12(u.start)}-${fmtTime12(u.end)}`:'',kwh:u.kwh,cost:u.cost})),
+    ...tv.map(u=>({type:'TV',name:durationLabel(u.minutes||(u.hours||0)*60),date:u.date,time:u.start&&u.end?`${fmtTime12(u.start)}-${fmtTime12(u.end)}`:'',kwh:u.kwh,cost:u.cost})),
+    ...sessions.map(u=>({type:'Appliance',name:`${u.name} · ${durationLabel(u.minutes)}`,date:u.date,time:u.start&&u.end?`${fmtTime12(u.start)}-${fmtTime12(u.end)}`:'',kwh:u.kwh,cost:u.cost}))
+  ].sort((a,b)=>b.date.localeCompare(a.date)||String(b.time).localeCompare(String(a.time)));
+  const [y,m]=monthKey.split('-').map(Number),days=daysInMonth(y,m-1),totalKwh=airconKwh+tvKwh+sessionKwh+alwaysKwh,totalCost=airconCost+tvCost+sessionCost+alwaysCost;
+  return{monthKey,days,aircon,tv,sessions,always,logs,top,airconKwh,airconCost,airconHours,tvKwh,tvCost,tvHours,sessionKwh,sessionCost,sessionHours,alwaysKwh,alwaysCost,totalKwh,totalCost,rate};
 }
 function weatherSettings(data=S?.data){
   return{
@@ -396,6 +455,7 @@ function sk(k){k?localStorage.setItem(GK,k):localStorage.removeItem(GK);}
 let S={
   tab:'dash',data:ld(),geminiKey:lk(),drawerOpen:false,
   modal:null,viewMk:curMk(),billsMk:curMk(),chartCycleKey:'',chartMonthKey:curMk(),selectedMealDate:toStr(),
+  auditOpen:false,
   airTimer:null,weatherLoading:false,weatherErr:'',
   // setup
   setupInput:'',setupErr:'',setupLoading:false,setupShow:false,
@@ -408,6 +468,7 @@ let S={
   tvF:{date:toStr(),start:'19:00',end:'22:00'},
   applianceF:{name:'',category:'Others',watts:'',qty:'1',sessionMinutes:'60',alwaysOn:false,note:''},
   applianceSessionF:{applianceId:'',date:toStr(),start:'19:00',end:'20:00',minutes:''},
+  auditF:{startDate:'2026-05-31',startTime:'16:05',startRead:'43183',endDate:'2026-06-02',endTime:'18:03',endRead:'43199'},
   airSetF:{rate:'',readDay:'',startup:'',sleepDay:'',sleepNight:'',ecoDay:'',ecoNight:'',day:'',night:'',defaultMode:'sleep',defaultSleep:true,defaultTemp:'',tempBaseline:'29',tempStep:'7',outdoorBaseline:'30',outdoorStep:'2.5',tvWatts:''},
   airconProfileF:{model:'',outdoorModel:'',coolingKw:'',ratedWatts:'',minWatts:'',maxWatts:'',cspf:'',doeMonthlyKwh:''},
   settingsF:{geminiKey:'',weatherProvider:'open-meteo',weatherLabel:'',weatherLat:'',weatherLon:'',weatherElevation:'',weatherApiKey:''},
@@ -561,9 +622,10 @@ function startActiveSession(type,opts={}){
   const exists=(d.activeSessions||[]).some(s=>s.type===type&&(type!=='appliance'||s.applianceId===opts.applianceId));
   if(exists)return;
   if(type==='aircon'){
-    const mode=airconModeFrom(d.airconDefaultMode,d.airconDefaultSleepMode),tempC=parseFloat(d.airconDefaultTemp);
+    const mode=airconModeFrom(opts.mode||d.airconDefaultMode,opts.sleepMode??d.airconDefaultSleepMode),tempC=parseFloat(opts.tempC??d.airconDefaultTemp);
     const w=d.weather||{};
-    const s={id:uid(),type,name:'Aircon',startedAt:new Date().toISOString(),mode,sleepMode:mode==='sleep',tempC:isNaN(tempC)?'':tempC,roomTemp:'',outdoorTemp:w.temp??'',outdoorFeels:w.apparent??'',outdoorHumidity:w.humidity??'',weatherAtStart:w};
+    const outdoorTemp=opts.outdoorTemp??w.temp??'',outdoorFeels=opts.outdoorFeels??w.apparent??'',outdoorHumidity=opts.outdoorHumidity??w.humidity??'';
+    const s={id:uid(),type,name:'Aircon',startedAt:new Date().toISOString(),mode,sleepMode:mode==='sleep',tempC:isNaN(tempC)?'':tempC,roomTemp:opts.roomTemp??'',outdoorTemp,outdoorFeels,outdoorHumidity,weatherAtStart:w};
     setD(d=>({...d,activeSessions:[s,...(d.activeSessions||[])]}));
   }else if(type==='tv'){
     const watts=parseFloat(d.tvWatts)||175;
@@ -1128,10 +1190,17 @@ function renderDash(){
   const c2=D('card');c2.innerHTML=`<div class="cp"><div class="lbl">Groceries This Month</div><div class="sf" style="font-size:23px;color:${groceryMonth>(data.groceryBudget||5000)?'#b83030':'#3a2818'};margin:2px 0">${fmt(groceryMonth)}</div><div style="font-size:10.5px;color:#8a7260">Monthly budget: ${fmt(data.groceryBudget||5000)}</div></div>`;
   g2.appendChild(c1);g2.appendChild(c2);sec.appendChild(g2);
   sec.appendChild(renderWeatherCard(data,{title:'Weather'}));
-  if (airconCost + tvCost + applianceCost > 0) {
-    const acCard = D('card'); acCard.innerHTML = `<div class="cp"><div class="lbl">Electricity Cycle · ${cycleLabel(eCycle)}</div><div class="sf" style="font-size:23px;margin:2px 0">${fmt2(airconCost+tvCost+applianceCost)}</div><div style="font-size:10.5px;color:#8a7260">24/7 ${fmt2(cycleAlwaysOnCost)} · Sessions ${fmt2(applianceSessionCost)} · Aircon ${fmt2(airconCost)} · TV ${fmt2(tvCost)}</div></div>`;
-    sec.appendChild(acCard);
-  }
+  const acCard = D('card');
+  const acp=D('cp');
+  acp.innerHTML = `<div class="lbl">Electricity Cycle · ${cycleLabel(eCycle)}</div><div class="sf" style="font-size:23px;margin:2px 0">${fmt2(airconCost+tvCost+applianceCost)}</div><div style="font-size:10.5px;color:#8a7260">24/7 ${fmt2(cycleAlwaysOnCost)} · Sessions ${fmt2(applianceSessionCost)} · Aircon ${fmt2(airconCost)} · TV ${fmt2(tvCost)}</div>`;
+  acCard.appendChild(acp);sec.appendChild(acCard);
+  const eActs=D('');eActs.style.cssText='display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-bottom:9px';
+  const eBtn=(label,fn,dis=false)=>{const b=Btn('bgfull',label,fn,dis);b.style.cssText='width:100%;padding:10px 4px;font-size:12px';return b;};
+  eActs.appendChild(eBtn('+ Aircon',()=>{const mode=airconModeFrom(data.airconDefaultMode,data.airconDefaultSleepMode),w=data.weather||{};set({modal:'addAircon',airconF:{...timedSessionDraft(S.airconF,480),mode,sleepMode:mode==='sleep',tempC:data.airconDefaultTemp||S.airconF.tempC||'29',roomTemp:S.airconF.roomTemp||'',outdoorTemp:w.temp??S.airconF.outdoorTemp??'',outdoorFeels:w.apparent??S.airconF.outdoorFeels??'',outdoorHumidity:w.humidity??S.airconF.outdoorHumidity??''}});}));
+  eActs.appendChild(eBtn('+ TV',()=>set({modal:'addTv',tvF:timedSessionDraft(S.tvF,180)})));
+  eActs.appendChild(eBtn('+ Appliance',()=>{const first=(data.appliances||[]).find(a=>!a.alwaysOn);set({modal:'logAppliance',applianceSessionF:applianceSessionDraft(first)});},!(data.appliances||[]).some(a=>!a.alwaysOn)));
+  sec.appendChild(eActs);
+  sec.appendChild(renderCurrentlyOn(data));
   // 7-day chart
   const cc=D('card');cc.style.cursor='pointer';cc.onclick=()=>set({modal:'mealsMonthChart',chartMonthKey:curMk(),selectedMealDate:toStr()});const ccp=D('cp');ccp.style.paddingBottom='5px';
   const cr=D('row');cr.style.marginBottom='11px';cr.innerHTML=`<span class="lbl">7-Day Meals Spending</span><span style="font-size:11px;color:#8a7260">Avg ${fmt(Math.round(avgD))}/day</span>`;
@@ -1147,22 +1216,43 @@ function renderDash(){
   ccp.appendChild(cr);ccp.appendChild(bars);ccp.appendChild(Object.assign(D(''),{style:'font-size:10px;color:#8a7260;margin-top:6px',textContent:'🟢 Within budget   🔴 Over budget'}));
   cc.appendChild(ccp);sec.appendChild(cc);
   const lb=Btn('bp bfull','+ Log Food / Expense',()=>set({modal:'addTx',txF:{...S.txF,date:toStr()}}));lb.style.marginBottom='4px';sec.appendChild(lb);
-  // Recent (Excluded Aircon from recent deductions list)
-  const allTx=[...(data.transactions||[]).slice(0,6).map(t=>({...t,type:'food'})),...(data.homeExpenses||[]).slice(0,4).map(t=>({...t,type:'home'}))].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,8);
+  const mealLogs=(data.transactions||[]).filter(isHomeCookedTx).sort((a,b)=>b.date.localeCompare(a.date)).slice(0,5);
+  if(mealLogs.length){
+    const mc=D('card');mc.appendChild(Object.assign(D(''),{style:'padding:8px 13px;border-bottom:1px solid #e2d9ce',innerHTML:'<span class="lbl">Recent Meal Logs</span>'}));
+    mealLogs.forEach(tx=>{
+      const row=D('row cr');row.style.borderBottom='1px solid #e2d9ce';
+      const left=D('');left.style.cssText='flex:1;min-width:0';
+      left.appendChild(h('div',{style:'font-size:13px;font-weight:700;color:#3a2818;line-height:1.25'},`Home-cooked${tx.note?' · '+tx.note:''}`));
+      const info=D('');info.style.cssText='font-size:10.5px;color:#8a7260;margin-top:2px;display:flex;align-items:center;gap:4px';
+      info.appendChild(Sp('bdg bdg-f','Meal Log'));
+      info.appendChild(document.createTextNode(' '+new Date(tx.date+'T12:00:00').toLocaleDateString('en-PH',{month:'short',day:'numeric'})));
+      left.appendChild(info);
+      const right=D('');right.style.cssText='display:flex;align-items:center;gap:6px;flex-shrink:0';
+      right.appendChild(h('button',{cls:'del',onClick:()=>delTx(tx.id)},'×'));
+      row.appendChild(left);row.appendChild(right);mc.appendChild(row);
+    });
+    sec.appendChild(mc);
+  }
+  // Recent (Excluded Aircon and Home-cooked meal logs from recent deductions list)
+  const paidFood=(data.transactions||[]).filter(t=>!isHomeCookedTx(t));
+  const allTx=[...paidFood.slice(0,6).map(t=>({...t,type:'food'})),...(data.homeExpenses||[]).slice(0,4).map(t=>({...t,type:'home'}))].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,8);
   if(allTx.length){
     const rc=D('card');rc.appendChild(Object.assign(D(''),{style:'padding:8px 13px;border-bottom:1px solid #e2d9ce',innerHTML:'<span class="lbl">Recent Expenses</span>'}));
     allTx.forEach(tx=>{
-      const row=D('row cr');row.style.borderBottom='1px solid #e2d9ce';
-      const left=D('');
+      const row=D('row cr');row.style.cssText='border-bottom:1px solid #e2d9ce;align-items:flex-start;gap:8px';
+      const left=D('');left.style.cssText='flex:1;min-width:0';
       const nm=D('');nm.style.cssText='font-size:12.5px;font-weight:600';nm.textContent=tx.type==='food'?tx.source:tx.name;
-      const info=D('');info.style.cssText='font-size:10.5px;color:#8a7260;margin-top:1px;display:flex;align-items:center;gap:4px';
+      const info=D('');info.style.cssText='font-size:10.5px;color:#8a7260;margin-top:1px;display:flex;align-items:flex-start;gap:4px;line-height:1.35';
       const bcls=tx.type==='food'?'bdg-f':tx.type==='home'?'bdg-h':'bdg-a';
       info.appendChild(Sp('bdg '+bcls,tx.type==='food'?'Food':tx.type==='home'?'Home':'Aircon'));
-      info.appendChild(document.createTextNode((tx.note?' '+tx.note+' ·':'')+' '+new Date(tx.date+'T12:00:00').toLocaleDateString('en-PH',{month:'short',day:'numeric'})));
+      info.appendChild(h('span',{style:'min-width:0'},`${tx.note?tx.note+' · ':''}${new Date(tx.date+'T12:00:00').toLocaleDateString('en-PH',{month:'short',day:'numeric'})}`));
       left.appendChild(nm);left.appendChild(info);
-      const right=D('');right.style.cssText='display:flex;align-items:center;gap:6px';
-      const amt=D('');amt.style.cssText=`font-weight:700;color:${tx.amount?'#b83030':'#8a7260'};font-size:13px`;amt.textContent=tx.amount?'-'+fmt(tx.amount):fmt(0);
-      right.appendChild(amt);right.appendChild(h('button',{cls:'del',onClick:()=>tx.type==='food'?delTx(tx.id):delHome(tx.id)},'×'));
+      const right=D('');right.style.cssText='display:flex;align-items:center;justify-content:flex-end;gap:5px;flex:0 0 auto;min-width:82px;text-align:right;align-self:stretch';
+      if(!(tx.type==='food'&&isHomeCookedTx(tx))){
+        const amt=D('');amt.style.cssText=`font-weight:700;color:${tx.amount?'#b83030':'#8a7260'};font-size:13px;white-space:nowrap;text-align:right;line-height:1.25`;amt.textContent=tx.amount?'-'+fmt(tx.amount):fmt(0);
+        right.appendChild(amt);
+      }
+      right.appendChild(h('button',{cls:'del',onClick:()=>tx.type==='food'?delTx(tx.id):delHome(tx.id)},'×'));
       row.appendChild(left);row.appendChild(right);rc.appendChild(row);
     });
     sec.appendChild(rc);
@@ -1199,13 +1289,27 @@ function renderFood(){
   else {fa.appendChild(Btn('bgsm','Select',()=>set({multiFood:true,selFood:new Set()})));fa.appendChild(Btn('bgsm','📦 Pantry',()=>set({tab:'stocks'})));fa.appendChild(Btn('bp bsm','+ Add',()=>set({modal:'addTx',txF:{...S.txF,date:toStr()}})));}
   toprow.appendChild(fa);sec.appendChild(toprow);
   const mTx=data.transactions.filter(t=>mk(t.date)===S.viewMk);
-  const mealTx=mTx.filter(t=>!isGroceryTx(t)),groceryTx=mTx.filter(isGroceryTx);
-  const mTotal=mTx.reduce((s,t)=>s+t.amount,0),mealTotal=mealTx.reduce((s,t)=>s+t.amount,0),groceryTotal=groceryTx.reduce((s,t)=>s+t.amount,0);
+  const homeCookedTx=mTx.filter(isHomeCookedTx),expenseTx=mTx.filter(t=>!isHomeCookedTx(t));
+  const mealTx=expenseTx.filter(t=>!isGroceryTx(t)),groceryTx=expenseTx.filter(isGroceryTx);
+  const mTotal=expenseTx.reduce((s,t)=>s+t.amount,0),mealTotal=mealTx.reduce((s,t)=>s+t.amount,0),groceryTotal=groceryTx.reduce((s,t)=>s+t.amount,0);
   const mDays=[...new Set(mealTx.map(t=>t.date))].length;
-  const msc=D('card cg');msc.style.marginBottom='9px';msc.innerHTML=`<div class="cp"><div class="row" style="margin-bottom:9px"><div><div class="lblw">Food Spending — ${mklbl(S.viewMk)}</div><div class="sf" style="font-size:28px;color:#fff;margin:2px 0">${fmt(mTotal)}</div><div style="font-size:11px;color:rgba(255,255,255,.55)">${mTx.length} transactions · meals and groceries separated</div></div><div style="text-align:right"><div class="lblw">Meal Avg/Day</div><div class="sf" style="font-size:20px;color:#fff;margin-top:3px">${fmt(mDays?Math.round(mealTotal/mDays):0)}</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px"><div style="background:rgba(255,255,255,.1);border-radius:8px;padding:7px"><div class="lblw">Meals</div><div class="sf" style="font-size:16px;color:#fff">${fmt(mealTotal)}</div></div><div style="background:rgba(255,255,255,.1);border-radius:8px;padding:7px"><div class="lblw">Groceries</div><div class="sf" style="font-size:16px;color:${groceryTotal>(data.groceryBudget||5000)?'#ffd07a':'#fff'}">${fmt(groceryTotal)}</div><div style="font-size:9.5px;color:rgba(255,255,255,.55)">Budget ${fmt(data.groceryBudget||5000)}</div></div></div></div>`;
+  const msc=D('card cg');msc.style.marginBottom='9px';msc.innerHTML=`<div class="cp"><div class="row" style="margin-bottom:9px"><div><div class="lblw">Food Spending — ${mklbl(S.viewMk)}</div><div class="sf" style="font-size:28px;color:#fff;margin:2px 0">${fmt(mTotal)}</div><div style="font-size:11px;color:rgba(255,255,255,.55)">${expenseTx.length} expense${expenseTx.length!==1?'s':''} · ${homeCookedTx.length} meal log${homeCookedTx.length!==1?'s':''}</div></div><div style="text-align:right"><div class="lblw">Meal Avg/Day</div><div class="sf" style="font-size:20px;color:#fff;margin-top:3px">${fmt(mDays?Math.round(mealTotal/mDays):0)}</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px"><div style="background:rgba(255,255,255,.1);border-radius:8px;padding:7px"><div class="lblw">Meals</div><div class="sf" style="font-size:16px;color:#fff">${fmt(mealTotal)}</div></div><div style="background:rgba(255,255,255,.1);border-radius:8px;padding:7px"><div class="lblw">Groceries</div><div class="sf" style="font-size:16px;color:${groceryTotal>(data.groceryBudget||5000)?'#ffd07a':'#fff'}">${fmt(groceryTotal)}</div><div style="font-size:9.5px;color:rgba(255,255,255,.55)">Budget ${fmt(data.groceryBudget||5000)}</div></div></div></div>`;
   sec.appendChild(msc);
   if(!mTx.length){const e=D('card empty');e.innerHTML='<div style="font-size:34px;margin-bottom:7px">🍽️</div><div>No food expenses logged for this month.</div>';sec.appendChild(e);return sec;}
-  const grouped=mTx.reduce((acc,tx)=>{if(!acc[tx.date])acc[tx.date]=[];acc[tx.date].push(tx);return acc;},{});
+  if(homeCookedTx.length){
+    const mc=D('card');mc.appendChild(DivHdr('Meal Logs'));
+    homeCookedTx.sort((a,b)=>b.date.localeCompare(a.date)).forEach(tx=>{
+      const inner=D('row cr');inner.style.cssText='border-bottom:1px solid #e2d9ce;justify-content:flex-start;gap:9px';
+      if(S.multiFood)inner.appendChild(h('input',{type:'checkbox',checked:S.selFood.has(tx.id),style:'width:18px;height:18px;flex:0 0 18px',onClick:e=>{e.stopPropagation();toggleSel('food',tx.id);}}));
+      const left=D('');left.style.cssText='flex:1;min-width:0';
+      left.appendChild(h('div',{style:'font-size:13px;font-weight:700;color:#3a2818;line-height:1.25'},`Home-cooked${tx.note?' · '+tx.note:''}`));
+      left.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260;margin-top:2px'},new Date(tx.date+'T12:00:00').toLocaleDateString('en-PH',{weekday:'short',month:'short',day:'numeric'})));
+      inner.appendChild(left);
+      mc.appendChild(S.multiFood?inner:swRow(inner,()=>openEdit('food',tx.id),()=>delTx(tx.id)));
+    });
+    sec.appendChild(mc);
+  }
+  const grouped=expenseTx.reduce((acc,tx)=>{if(!acc[tx.date])acc[tx.date]=[];acc[tx.date].push(tx);return acc;},{});
   Object.keys(grouped).sort((a,b)=>b.localeCompare(a)).forEach(ds=>{
     const txs=grouped[ds],total=txs.reduce((s,t)=>s+t.amount,0),mealTotal=txs.filter(t=>!isGroceryTx(t)).reduce((s,t)=>s+t.amount,0),groceryTotal=txs.filter(isGroceryTx).reduce((s,t)=>s+t.amount,0),over=mealTotal>data.dailyBudget;
     const card=D('card');
@@ -1217,7 +1321,8 @@ function renderFood(){
       const inner=D('row cr');inner.style.borderBottom='1px solid #e2d9ce';
       inner.style.justifyContent='flex-start';inner.style.gap='9px';
       if(S.multiFood)inner.appendChild(h('input',{type:'checkbox',checked:S.selFood.has(tx.id),style:'width:18px;height:18px;flex:0 0 18px',onClick:e=>{e.stopPropagation();toggleSel('food',tx.id);}}));
-      const left=D('');left.style.cssText='flex:1;min-width:0';left.appendChild(h('div',{style:'font-size:12px;font-weight:600'},tx.source));
+      const left=D('');left.style.cssText='flex:1;min-width:0';
+      left.appendChild(h('div',{style:'font-size:12px;font-weight:600'},tx.source));
       left.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260'},`${tx.note?tx.note+' · ':''}${tx.discount?`Discount ${fmt(tx.discount)} · `:''}${new Date(tx.date+'T12:00:00').toLocaleDateString('en-PH',{month:'short',day:'numeric'})}`));
       const right=D('');right.style.cssText='display:flex;align-items:center;gap:6px;flex-shrink:0';
       right.appendChild(h('span',{style:'font-weight:700;font-size:13px'},fmt(tx.amount)));
@@ -1228,7 +1333,8 @@ function renderFood(){
     });
     const foot=D('');foot.style.cssText='padding:5px 13px;display:flex;justify-content:flex-end';
     foot.appendChild(h('span',{style:`font-size:10.5px;color:${over?'#b83030':'#8a7260'}`},over?`Meals ₱${(mealTotal-data.dailyBudget).toFixed(0)} over budget`:`Meals ₱${(data.dailyBudget-mealTotal).toFixed(0)} remaining`));
-    card.appendChild(foot);sec.appendChild(card);
+    card.appendChild(foot);
+    sec.appendChild(card);
   });
   return sec;
 }
@@ -1489,10 +1595,16 @@ function renderReports(){
   // Hero card
   const hero=D('card cg');hero.style.marginBottom='9px';
   hero.innerHTML=`<div class="cp"><div class="row" style="margin-bottom:10px"><div><div class="lblw">Total Spending — ${mklbl(rm)}</div><div class="sf" style="font-size:32px;color:#fff;margin:2px 0">${fmt(grandTotal)}</div></div></div><div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px"><div style="background:rgba(255,255,255,.1);border-radius:8px;padding:8px 5px"><div style="font-size:9px;color:rgba(255,255,255,.55);font-weight:700;text-transform:uppercase;letter-spacing:.3px">Food</div><div class="sf" style="font-size:13px;color:#fff;margin-top:2px">${fmt(foodTotal)}</div></div><div style="background:rgba(255,255,255,.1);border-radius:8px;padding:8px 5px"><div style="font-size:9px;color:rgba(255,255,255,.55);font-weight:700;text-transform:uppercase;letter-spacing:.3px">Home</div><div class="sf" style="font-size:13px;color:#fff;margin-top:2px">${fmt(homeTotal)}</div></div><div style="background:rgba(255,255,255,.1);border-radius:8px;padding:8px 5px"><div style="font-size:9px;color:rgba(255,255,255,.55);font-weight:700;text-transform:uppercase;letter-spacing:.3px">Bills</div><div class="sf" style="font-size:13px;color:#fff;margin-top:2px">${fmt(billsTotal)}</div></div><div style="background:rgba(255,255,255,.1);border-radius:8px;padding:8px 5px"><div style="font-size:9px;color:rgba(255,255,255,.55);font-weight:700;text-transform:uppercase;letter-spacing:.3px">Electric</div><div class="sf" style="font-size:13px;color:#fff;margin-top:2px">${fmt(electricityTotal)}</div></div></div></div>`;
+  const foodTile=hero.querySelector('.cp > div:nth-child(2) > div:nth-child(1)');
+  const homeTile=hero.querySelector('.cp > div:nth-child(2) > div:nth-child(2)');
+  const electricTile=hero.querySelector('.cp > div:nth-child(2) > div:nth-child(4)');
+  if(foodTile){foodTile.style.cursor='pointer';foodTile.onclick=()=>set({modal:'foodReport',chartMonthKey:rm});}
+  if(homeTile){homeTile.style.cursor='pointer';homeTile.onclick=()=>set({modal:'homeReport',chartMonthKey:rm});}
+  if(electricTile){electricTile.style.cursor='pointer';electricTile.onclick=()=>set({modal:'electricityReport',chartMonthKey:rm});}
   sec.appendChild(hero);
   // Category breakdown
   const catData={};
-  foodTx.forEach(t=>{const key=t.source;if(!catData[key])catData[key]={amount:0,type:'food'};catData[key].amount+=t.amount;});
+  foodTx.filter(t=>!isHomeCookedTx(t)).forEach(t=>{const key=t.source;if(!catData[key])catData[key]={amount:0,type:'food'};catData[key].amount+=t.amount;});
   homeEx.forEach(e=>{const key=e.category;if(!catData[key])catData[key]={amount:0,type:'home'};catData[key].amount+=e.amount;});
   if(billsTotal>0)catData['Bills']={amount:billsTotal,type:'bill'};
   if(electricityTotal>0)catData['Electricity']={amount:electricityTotal,type:'aircon'};
@@ -1517,10 +1629,11 @@ function renderReports(){
     bcard.appendChild(bcp);sec.appendChild(bcard);
   }
   // Daily spending chart for the month
-  if(foodTx.length){
+  const paidFoodTx=foodTx.filter(t=>!isHomeCookedTx(t));
+  if(paidFoodTx.length){
     const dc=D('card');dc.appendChild(Object.assign(D(''),{style:'padding:8px 13px;background:#faf6f1;border-bottom:1px solid #e2d9ce',innerHTML:'<span class="lbl">Food Spending by Source</span>'}));
     const dcp=D('cp');
-    const bySrc=foodTx.reduce((acc,t)=>{if(!acc[t.source])acc[t.source]=0;acc[t.source]+=t.amount;return acc;},{});
+    const bySrc=paidFoodTx.reduce((acc,t)=>{if(!acc[t.source])acc[t.source]=0;acc[t.source]+=t.amount;return acc;},{});
     const maxSrc=Math.max(...Object.values(bySrc),1);
     Object.entries(bySrc).sort((a,b)=>b[1]-a[1]).forEach(([src,amt])=>{
       const row=D('rpt-bar-row');
@@ -1643,6 +1756,103 @@ function renderStocks(){
 }
 
 // ─── ELECTRICITY TAB ─────────────────────────────────────────
+function renderMeterAudit(){
+  const data=S.data,f=S.auditF,a=meterAudit(data,f),card=D('card');
+  const hdr=D('row');
+  hdr.style.cssText='padding:8px 13px;background:#faf6f1;border-bottom:1px solid #e2d9ce;cursor:pointer;gap:8px';
+  const left=D('');left.style.cssText='flex:1;min-width:0';
+  left.appendChild(h('span',{style:'font-weight:700;font-size:13px'},'Meter Audit'));
+  if(a.valid){
+    const sub=h('div',{style:'font-size:10px;color:#8a7260;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'},`${a.meterKwh.toFixed(2)} kWh meter · ${a.meterKwh?Math.round(a.matchPct)+'% matched · ':''}${a.gap>=0?'+':''}${a.gap.toFixed(2)} kWh gap`);
+    left.appendChild(sub);
+  }
+  hdr.appendChild(left);
+  hdr.appendChild(h('span',{style:'font-size:16px;color:#8a7260;flex-shrink:0'},S.auditOpen?'▴':'▾'));
+  hdr.onclick=()=>set({auditOpen:!S.auditOpen});
+  card.appendChild(hdr);
+  if(!S.auditOpen)return card;
+  const cp=D('cp');
+  const grid=D('g2 audit-grid');grid.style.marginBottom='8px';
+  const addField=(label,key,type='text',step='')=>{
+    const input=Inp('',{type,value:f[key]||'',...(step?{step}:{})});
+    input.oninput=e=>S.auditF[key]=e.target.value;
+    grid.appendChild(Fg(label,input));
+  };
+  addField('Start Date','startDate','date');addField('Start Time','startTime','time');
+  addField('Start Reading','startRead','number','0.001');addField('End Reading','endRead','number','0.001');
+  addField('End Date','endDate','date');addField('End Time','endTime','time');
+  cp.appendChild(grid);
+  const run=Btn('bgfull','Run Audit',()=>set({auditF:{...S.auditF}}));run.style.marginBottom='8px';cp.appendChild(run);
+  if(!a.valid){
+    cp.appendChild(h('div',{style:'font-size:11px;color:#8a7260;line-height:1.5'},a.error));
+    card.appendChild(cp);return card;
+  }
+  const closeGap=a.meterKwh?Math.abs(a.gap)<=Math.max(1,a.meterKwh*0.1):false;
+  const gapColor=closeGap?'#2e6e4f':a.gap>0?'#b8720c':'#8b2d2d';
+  cp.appendChild(metricTiles([
+    {label:'Meter',value:`${a.meterKwh.toFixed(2)} kWh`,color:'#3a2818'},
+    {label:'App Est.',value:`${a.estimatedKwh.toFixed(2)} kWh`,color:'#1a56c4'},
+    {label:'Matched',value:a.meterKwh?`${Math.round(a.matchPct)}%`:'--',color:closeGap?'#2e6e4f':gapColor},
+    {label:'Gap',value:`${a.gap>=0?'+':''}${a.gap.toFixed(2)} kWh`,color:gapColor}
+  ],true));
+  cp.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260;line-height:1.5;margin-top:7px'},`${durationLabel(a.hours*60)} window · ${a.meterKwh?Math.round(a.matchPct)+'% matched · ':''}Sessions ${a.loggedKwh.toFixed(2)} kWh · 24/7 ${a.alwaysKwh.toFixed(2)} kWh · ${fmt2(a.estimatedKwh*a.rate)} estimated. Positive gap means meter used more than logged.`));
+  const parts=D('g2');parts.style.marginTop='8px';
+  [
+    ['Aircon',a.airconKwh,a.aircon.length],
+    ['TV',a.tvKwh,a.tv.length],
+    ['Sessions',a.sessionKwh,a.appliances.length],
+    ['24/7',a.alwaysKwh,a.alwaysRows.length]
+  ].forEach(([label,kwh,count])=>{
+    const box=D('');box.style.cssText='background:#faf6f1;border:1px solid #e2d9ce;border-radius:8px;padding:7px';
+    box.appendChild(h('div',{cls:'lbl'},label));
+    box.appendChild(h('div',{cls:'sf',style:'font-size:15px;margin-top:1px'},`${kwh.toFixed(3)} kWh`));
+    box.appendChild(h('div',{style:'font-size:9.5px;color:#8a7260'},`${count} item${count!==1?'s':''}`));
+    parts.appendChild(box);
+  });
+  cp.appendChild(parts);
+  const rows=[
+    ...a.aircon.map(u=>({type:'Aircon',name:`${airconModeLabel(u.mode,u.sleepMode)} · ${durationLabel(u.minutes||(u.hours||0)*60)}`,date:u.date,time:u.start&&u.end?`${fmtTime12(u.start)}-${fmtTime12(u.end)}`:'date only',kwh:u.kwh})),
+    ...a.tv.map(u=>({type:'TV',name:durationLabel(u.minutes||(u.hours||0)*60),date:u.date,time:u.start&&u.end?`${fmtTime12(u.start)}-${fmtTime12(u.end)}`:'date only',kwh:u.kwh})),
+    ...a.appliances.map(u=>({type:'Appliance',name:`${u.name} · ${durationLabel(u.minutes)}`,date:u.date,time:u.start&&u.end?`${fmtTime12(u.start)}-${fmtTime12(u.end)}`:'date only',kwh:u.kwh})),
+    ...a.alwaysRows.map(u=>({type:'24/7',name:u.name,date:'whole window',time:`${parseFloat(u.watts)||0}W x ${parseFloat(u.qty)||1}`,kwh:u.kwh}))
+  ].sort((x,y)=>String(x.date).localeCompare(String(y.date))||String(x.time).localeCompare(String(y.time)));
+  const list=D('');list.style.marginTop='8px';
+  rows.forEach(r=>{
+    const row=D('row');row.style.cssText='border-top:1px solid #e2d9ce;padding:7px 0;gap:8px;align-items:flex-start';
+    const left=D('');left.style.cssText='flex:1;min-width:0';
+    left.appendChild(h('div',{style:'font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'},`${r.type} · ${r.name}`));
+    left.appendChild(h('div',{style:'font-size:10px;color:#8a7260'},`${r.date} · ${r.time}`));
+    row.appendChild(left);
+    row.appendChild(h('div',{cls:'sf',style:'font-size:13px;flex-shrink:0'},`${(parseFloat(r.kwh)||0).toFixed(3)} kWh`));
+    list.appendChild(row);
+  });
+  if(rows.length)cp.appendChild(list);
+  card.appendChild(cp);
+  return card;
+}
+function renderCurrentlyOn(data=S.data){
+  const active=data.activeSessions||[],liveCard=D('card');
+  liveCard.appendChild(DivHdr('Currently On'));
+  if(active.length){
+    active.forEach(s=>{
+      const est=activeEstimate(s,new Date(),data);
+      const inner=D('row cr');inner.style.cssText='border-bottom:1px solid #e2d9ce;gap:9px';
+      const left=D('');left.style.cssText='flex:1;min-width:0';
+      left.appendChild(h('div',{style:'font-size:12.5px;font-weight:700'},s.name));
+      left.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260'},`${s.type==='aircon'?'Aircon · '+airconModeLabel(s.mode,s.sleepMode):s.type==='tv'?'TV':'Appliance'} · on since ${fmtTime12(timeOf(new Date(s.startedAt)))} · ${durationLabel(est.minutes)}${s.outdoorTemp!==''&&s.outdoorTemp!=null?' · out '+s.outdoorTemp+'C':''}`));
+      const right=D('');right.style.cssText='text-align:right;flex-shrink:0';
+      right.appendChild(h('div',{cls:'sf',style:'font-size:15px'},`${est.kwh.toFixed(3)} kWh`));
+      right.appendChild(h('div',{style:'font-size:10px;color:#8a7260'},fmt2(est.cost)));
+      const stop=Btn('ba bsm','Off',()=>stopActiveSession(s.id));stop.style.marginTop='4px';
+      const cancel=Btn('bgsm','Cancel',()=>cancelActiveSession(s.id));cancel.style.marginTop='4px';cancel.style.marginLeft='4px';
+      right.appendChild(stop);right.appendChild(cancel);
+      inner.appendChild(left);inner.appendChild(right);liveCard.appendChild(inner);
+    });
+  }else{
+    const empty=D('empty');empty.style.cssText='padding:16px;color:#8a7260;font-size:12px;text-align:center';empty.textContent='Nothing is currently running.';liveCard.appendChild(empty);
+  }
+  return liveCard;
+}
 function renderAircon(){
   const data=S.data,sec=D('sec');
   const rates=airconRates(data);
@@ -1699,6 +1909,7 @@ function renderAircon(){
 
   const kwhCard=D('card');kwhCard.innerHTML=`<div class="cp"><div class="lbl">Total kWh This Cycle</div><div class="sf" style="font-size:24px;margin:2px 0">${displayCycleKwh.toFixed(2)} kWh</div><div style="font-size:10.5px;color:#8a7260">${meralcoCycleKwh?'From Meralco bill input':'Estimated from logs'} · Aircon ${airconKwh.toFixed(2)} · TV ${tvKwh.toFixed(2)} · Appliances ${applianceKwh.toFixed(2)}</div></div>`;
   sec.appendChild(kwhCard);
+  sec.appendChild(renderMeterAudit());
 
   let alwaysCard=null;
   if(alwaysOn.length){
@@ -1746,27 +1957,6 @@ function renderAircon(){
   ccp.appendChild(cr);ccp.appendChild(bars);ccp.appendChild(legend);
   cc.appendChild(ccp);sec.appendChild(cc);
 
-  const active=data.activeSessions||[];
-  const liveCard=D('card');liveCard.appendChild(DivHdr('Currently On'));
-  if(active.length){
-    active.forEach(s=>{
-      const est=activeEstimate(s,new Date(),data);
-      const inner=D('row cr');inner.style.cssText='border-bottom:1px solid #e2d9ce;gap:9px';
-      const left=D('');left.style.cssText='flex:1;min-width:0';
-      left.appendChild(h('div',{style:'font-size:12.5px;font-weight:700'},s.name));
-      left.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260'},`${s.type==='aircon'?'Aircon · '+airconModeLabel(s.mode,s.sleepMode):s.type==='tv'?'TV':'Appliance'} · on since ${fmtTime12(timeOf(new Date(s.startedAt)))} · ${durationLabel(est.minutes)}${s.outdoorTemp!==''&&s.outdoorTemp!=null?' · out '+s.outdoorTemp+'C':''}`));
-      const right=D('');right.style.cssText='text-align:right;flex-shrink:0';
-      right.appendChild(h('div',{cls:'sf',style:'font-size:15px'},`${est.kwh.toFixed(3)} kWh`));
-      right.appendChild(h('div',{style:'font-size:10px;color:#8a7260'},fmt2(est.cost)));
-      const stop=Btn('ba bsm','Off',()=>stopActiveSession(s.id));stop.style.marginTop='4px';
-      const cancel=Btn('bgsm','Cancel',()=>cancelActiveSession(s.id));cancel.style.marginTop='4px';cancel.style.marginLeft='4px';
-      right.appendChild(stop);right.appendChild(cancel);
-      inner.appendChild(left);inner.appendChild(right);liveCard.appendChild(inner);
-    });
-  }else{
-    const empty=D('empty');empty.style.cssText='padding:16px;color:#8a7260;font-size:12px;text-align:center';empty.textContent='Nothing is currently running.';liveCard.appendChild(empty);
-  }
-
   const defaultMode=airconModeFrom(data.airconDefaultMode,data.airconDefaultSleepMode);
   const ap=airconProfile(data);
   const spec=D('card');spec.innerHTML=`<div class="cp"><div class="lbl">${ap.model} Estimate</div><div style="font-size:12px;color:#3a2818;line-height:1.6;margin-top:5px">Rated around <b>${ap.ratedWatts}W</b> with ${ap.minWatts}-${ap.maxWatts}W inverter range, CSPF <b>${ap.cspf}</b>, DOE <b>${ap.doeMonthlyKwh} kWh/month</b>. Startup now tapers for the first ${durationLabel(60)} from <b>${rates.startup} kWh/hr</b> into the selected mode. Sleep <b>${rates.sleepDay}/${rates.sleepNight}</b>, Eco <b>${rates.ecoDay}/${rates.ecoNight}</b>, Normal <b>${rates.day}/${rates.night}</b> day/night kWh/hr. Set temp adjusts by <b>${data.airconTempStepPct||7}%/C</b>; outdoor by <b>${data.airconOutdoorStepPct||2.5}%/C</b>.</div></div>`;
@@ -1783,7 +1973,7 @@ function renderAircon(){
   }));
   actions.appendChild(Btn('bgfull','Manage Appliances',()=>set({tab:'appliances'})));
   sec.appendChild(actions);
-  sec.appendChild(liveCard);
+  sec.appendChild(renderCurrentlyOn(data));
   if(alwaysCard)sec.appendChild(alwaysCard);
 
   if(!mUsage.length&&!mTv.length&&!mApplianceUsage.length&&!alwaysOnCost){const e=D('card empty');e.innerHTML='<div>No electricity usage logged for this month.</div>';sec.appendChild(e);return sec;}
@@ -2063,6 +2253,146 @@ function renderModal(){
     c.appendChild(Btn('bp bfull','Close',()=>set({modal:null})));
     return M('Full Month Chart',c);
   }
+  if(S.modal==='electricityReport'){
+    const monthKey=S.chartMonthKey||S.rptMk||curMk(),data=S.data,r=electricityReportForMonth(monthKey,data);
+    const c=D('');
+    const nav=D('row');nav.style.cssText='gap:8px;margin-bottom:9px';
+    const prev=Btn('bgsm','<',()=>set({chartMonthKey:shiftMonthKey(monthKey,-1)}));prev.style.width='36px';
+    const next=Btn('bgsm','>',()=>set({chartMonthKey:shiftMonthKey(monthKey,1)}));next.style.width='36px';
+    nav.appendChild(prev);nav.appendChild(h('div',{cls:'sf',style:'font-size:16px;flex:1;text-align:center;color:#3a2818'},mklbl(monthKey)));nav.appendChild(next);c.appendChild(nav);
+    const hero=D('');hero.style.cssText='background:#f7f3ee;border:1px solid #e2d9ce;border-radius:8px;padding:9px 10px;margin-bottom:8px';
+    hero.appendChild(h('div',{cls:'lbl'},'Usage Overview'));
+    hero.appendChild(h('div',{cls:'sf',style:'font-size:24px;color:#3a2818;margin-top:2px'},`${r.totalKwh.toFixed(2)} kWh`));
+    hero.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260;margin-top:3px'},`${fmt2(r.totalCost)} estimated · ${(r.totalKwh/r.days).toFixed(2)} kWh/day · ${r.logs.length} logged session${r.logs.length!==1?'s':''}`));
+    c.appendChild(hero);
+    c.appendChild(metricTiles([
+      {label:'Aircon',value:`${r.airconKwh.toFixed(2)} kWh`,color:'#b8720c'},
+      {label:'TV',value:`${r.tvKwh.toFixed(2)} kWh`,color:'#2e6e4f'},
+      {label:'Appliance',value:`${(r.sessionKwh+r.alwaysKwh).toFixed(2)} kWh`,color:'#1a56c4'}
+    ]));
+    const breakdown=D('card');breakdown.style.marginTop='10px';breakdown.appendChild(DivHdr('Consumption Breakdown'));
+    const bp=D('cp'),parts=[
+      ['Aircon',r.airconKwh,r.airconCost,'#b8720c'],
+      ['TV',r.tvKwh,r.tvCost,'#2e6e4f'],
+      ['Appliance Sessions',r.sessionKwh,r.sessionCost,'#6b4c36'],
+      ['24/7 Appliances',r.alwaysKwh,r.alwaysCost,'#1a56c4']
+    ],max=Math.max(...parts.map(p=>p[1]),1);
+    parts.forEach(([label,kwh,cost,color])=>{
+      const row=D('rpt-bar-row');
+      row.appendChild(h('div',{cls:'rpt-bar-label'},label));
+      const track=D('rpt-bar-track'),fill=D('rpt-bar-fill');fill.style.cssText=`width:${(kwh/max*100).toFixed(1)}%;background:${color}`;track.appendChild(fill);
+      row.appendChild(track);
+      const val=D('rpt-bar-val');val.textContent=`${kwh.toFixed(2)} kWh`;row.appendChild(val);
+      bp.appendChild(row);
+      bp.appendChild(h('div',{style:'font-size:9.5px;color:#8a7260;text-align:right;margin-top:-4px;margin-bottom:2px'},fmt2(cost)));
+    });
+    breakdown.appendChild(bp);c.appendChild(breakdown);
+    const top=D('card');top.appendChild(DivHdr('Most Consumption'));
+    if(r.top.length){
+      r.top.slice(0,6).forEach(item=>{
+        const row=D('row cr');row.style.cssText='border-bottom:1px solid #e2d9ce;gap:8px';
+        const left=D('');left.style.cssText='flex:1;min-width:0';
+        left.appendChild(h('div',{style:'font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'},item.name));
+        left.appendChild(h('div',{style:'font-size:10px;color:#8a7260'},`${item.type} · ${item.logs?item.logs+' log'+(item.logs!==1?'s':''):'24/7'}${item.hours?` · ${durationLabel(item.hours*60)}`:''}`));
+        const right=D('');right.style.cssText='text-align:right;flex-shrink:0';
+        right.appendChild(h('div',{cls:'sf',style:'font-size:14px'},`${item.kwh.toFixed(2)} kWh`));
+        right.appendChild(h('div',{style:'font-size:9.5px;color:#8a7260'},fmt2(item.cost)));
+        row.appendChild(left);row.appendChild(right);top.appendChild(row);
+      });
+    }else top.appendChild(Object.assign(D('empty'),{textContent:'No electricity usage logs for this month.'}));
+    c.appendChild(top);
+    const recent=D('card');recent.appendChild(DivHdr('Recent Usage Logs'));
+    if(r.logs.length){
+      r.logs.slice(0,8).forEach(log=>{
+        const row=D('row cr');row.style.cssText='border-bottom:1px solid #e2d9ce;gap:8px';
+        const left=D('');left.style.cssText='flex:1;min-width:0';
+        left.appendChild(h('div',{style:'font-size:12px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'},`${log.type} · ${log.name}`));
+        left.appendChild(h('div',{style:'font-size:10px;color:#8a7260'},`${new Date(log.date+'T12:00:00').toLocaleDateString('en-PH',{month:'short',day:'numeric'})}${log.time?' · '+log.time:''}`));
+        row.appendChild(left);
+        row.appendChild(h('div',{cls:'sf',style:'font-size:13px;flex-shrink:0'},`${(parseFloat(log.kwh)||0).toFixed(3)} kWh`));
+        recent.appendChild(row);
+      });
+    }else recent.appendChild(Object.assign(D('empty'),{textContent:'No session logs yet. 24/7 appliances are still included above.'}));
+    c.appendChild(recent);
+    c.appendChild(Btn('bp bfull','Close',()=>set({modal:null})));
+    return M('Electricity Usage Report',c);
+  }
+  if(S.modal==='foodReport'){
+    const monthKey=S.chartMonthKey||S.rptMk||curMk(),data=S.data;
+    const food=(data.transactions||[]).filter(t=>mk(t.date)===monthKey),paid=food.filter(t=>!isHomeCookedTx(t)),mealLogs=food.filter(isHomeCookedTx),groceries=paid.filter(isGroceryTx),meals=paid.filter(t=>!isGroceryTx(t));
+    const total=paid.reduce((s,t)=>s+t.amount,0),mealTotal=meals.reduce((s,t)=>s+t.amount,0),groceryTotal=groceries.reduce((s,t)=>s+t.amount,0);
+    const c=D('');
+    const nav=D('row');nav.style.cssText='gap:8px;margin-bottom:9px';
+    const prev=Btn('bgsm','<',()=>set({chartMonthKey:shiftMonthKey(monthKey,-1)}));prev.style.width='36px';
+    const next=Btn('bgsm','>',()=>set({chartMonthKey:shiftMonthKey(monthKey,1)}));next.style.width='36px';
+    nav.appendChild(prev);nav.appendChild(h('div',{cls:'sf',style:'font-size:16px;flex:1;text-align:center;color:#3a2818'},mklbl(monthKey)));nav.appendChild(next);c.appendChild(nav);
+    const hero=D('');hero.style.cssText='background:#f7f3ee;border:1px solid #e2d9ce;border-radius:8px;padding:9px 10px;margin-bottom:8px';
+    hero.appendChild(h('div',{cls:'lbl'},'Food Overview'));
+    hero.appendChild(h('div',{cls:'sf',style:'font-size:24px;color:#3a2818;margin-top:2px'},fmt(total)));
+    hero.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260;margin-top:3px'},`${paid.length} paid log${paid.length!==1?'s':''} · ${mealLogs.length} meal log${mealLogs.length!==1?'s':''} · ${fmt(Math.round(total/Math.max(1,[...new Set(paid.map(t=>t.date))].length)))}/active day`));
+    c.appendChild(hero);
+    c.appendChild(metricTiles([
+      {label:'Meals',value:fmt(mealTotal),color:'#2e6e4f'},
+      {label:'Groceries',value:fmt(groceryTotal),color:groceryTotal>(data.groceryBudget||5000)?'#b83030':'#1a56c4'},
+      {label:'Meal Logs',value:String(mealLogs.length),color:'#b8720c'}
+    ]));
+    const bySrc=paid.reduce((acc,t)=>{acc[t.source]=(acc[t.source]||0)+t.amount;return acc;},{});
+    const srcCard=D('card');srcCard.style.marginTop='10px';srcCard.appendChild(DivHdr('Spending by Source'));
+    const sp=D('cp'),maxSrc=Math.max(...Object.values(bySrc),1);
+    Object.entries(bySrc).sort((a,b)=>b[1]-a[1]).forEach(([src,amt])=>{
+      const row=D('rpt-bar-row');row.appendChild(h('div',{cls:'rpt-bar-label'},src));
+      const track=D('rpt-bar-track'),fill=D('rpt-bar-fill');fill.style.cssText=`width:${(amt/maxSrc*100).toFixed(1)}%;background:#2e6e4f`;track.appendChild(fill);
+      row.appendChild(track);row.appendChild(h('div',{cls:'rpt-bar-val'},fmt(amt)));sp.appendChild(row);
+    });
+    if(!Object.keys(bySrc).length)sp.appendChild(Object.assign(D('empty'),{textContent:'No paid food expenses this month.'}));
+    srcCard.appendChild(sp);c.appendChild(srcCard);
+    const mealCard=D('card');mealCard.appendChild(DivHdr('Meal Logs'));
+    if(mealLogs.length){
+      mealLogs.sort((a,b)=>b.date.localeCompare(a.date)).slice(0,10).forEach(t=>{
+        const row=D('row cr');row.style.cssText='border-bottom:1px solid #e2d9ce;gap:8px';
+        const left=D('');left.style.cssText='flex:1;min-width:0';
+        left.appendChild(h('div',{style:'font-size:12.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'},`Home-cooked${t.note?' · '+t.note:''}`));
+        left.appendChild(h('div',{style:'font-size:10px;color:#8a7260'},new Date(t.date+'T12:00:00').toLocaleDateString('en-PH',{weekday:'short',month:'short',day:'numeric'})));
+        row.appendChild(left);mealCard.appendChild(row);
+      });
+    }else mealCard.appendChild(Object.assign(D('empty'),{textContent:'No Home-cooked meal logs this month.'}));
+    c.appendChild(mealCard);
+    c.appendChild(Btn('bp bfull','Close',()=>set({modal:null})));
+    return M('Food Report',c);
+  }
+  if(S.modal==='homeReport'){
+    const monthKey=S.chartMonthKey||S.rptMk||curMk(),data=S.data,items=(data.homeExpenses||[]).filter(e=>mk(e.date)===monthKey);
+    const total=items.reduce((s,e)=>s+e.amount,0),count=items.length,byCat=items.reduce((acc,e)=>{acc[e.category]=(acc[e.category]||0)+e.amount;return acc;},{}),byStore=items.reduce((acc,e)=>{acc[e.store||'Unknown']=(acc[e.store||'Unknown']||0)+e.amount;return acc;},{});
+    const c=D('');
+    const nav=D('row');nav.style.cssText='gap:8px;margin-bottom:9px';
+    const prev=Btn('bgsm','<',()=>set({chartMonthKey:shiftMonthKey(monthKey,-1)}));prev.style.width='36px';
+    const next=Btn('bgsm','>',()=>set({chartMonthKey:shiftMonthKey(monthKey,1)}));next.style.width='36px';
+    nav.appendChild(prev);nav.appendChild(h('div',{cls:'sf',style:'font-size:16px;flex:1;text-align:center;color:#3a2818'},mklbl(monthKey)));nav.appendChild(next);c.appendChild(nav);
+    const hero=D('');hero.style.cssText='background:#f7f3ee;border:1px solid #e2d9ce;border-radius:8px;padding:9px 10px;margin-bottom:8px';
+    hero.appendChild(h('div',{cls:'lbl'},'Home Overview'));
+    hero.appendChild(h('div',{cls:'sf',style:'font-size:24px;color:#3a2818;margin-top:2px'},fmt(total)));
+    hero.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260;margin-top:3px'},`${count} item${count!==1?'s':''} · Avg ${fmt(Math.round(total/Math.max(1,count)))}/item`));
+    c.appendChild(hero);
+    const catCard=D('card');catCard.appendChild(DivHdr('Spending by Category'));
+    const cp=D('cp'),maxCat=Math.max(...Object.values(byCat),1);
+    Object.entries(byCat).sort((a,b)=>b[1]-a[1]).forEach(([cat,amt])=>{
+      const row=D('rpt-bar-row');row.appendChild(h('div',{cls:'rpt-bar-label'},cat));
+      const track=D('rpt-bar-track'),fill=D('rpt-bar-fill');fill.style.cssText=`width:${(amt/maxCat*100).toFixed(1)}%;background:#1a56c4`;track.appendChild(fill);
+      row.appendChild(track);row.appendChild(h('div',{cls:'rpt-bar-val'},fmt(amt)));cp.appendChild(row);
+    });
+    if(!items.length)cp.appendChild(Object.assign(D('empty'),{textContent:'No home expenses this month.'}));
+    catCard.appendChild(cp);c.appendChild(catCard);
+    const storeCard=D('card');storeCard.appendChild(DivHdr('Top Stores'));
+    const stp=D('cp'),maxStore=Math.max(...Object.values(byStore),1);
+    Object.entries(byStore).sort((a,b)=>b[1]-a[1]).slice(0,6).forEach(([store,amt])=>{
+      const row=D('rpt-bar-row');row.appendChild(h('div',{cls:'rpt-bar-label'},store));
+      const track=D('rpt-bar-track'),fill=D('rpt-bar-fill');fill.style.cssText=`width:${(amt/maxStore*100).toFixed(1)}%;background:#2e6e4f`;track.appendChild(fill);
+      row.appendChild(track);row.appendChild(h('div',{cls:'rpt-bar-val'},fmt(amt)));stp.appendChild(row);
+    });
+    storeCard.appendChild(stp);c.appendChild(storeCard);
+    c.appendChild(Btn('bp bfull','Close',()=>set({modal:null})));
+    return M('Home Report',c);
+  }
   if(S.modal==='addTx'){
     const c=D('');
     const isHomeCooked=S.txF.source==='Home-cooked';
@@ -2146,7 +2476,9 @@ function renderModal(){
     const ohFg=D('fg');ohFg.appendChild(h('label',{cls:'fl'},'Humidity %'));const ohi=Inp('',{type:'number',inputmode:'decimal',value:S.airconF.outdoorHumidity||''});ohi.oninput=e=>S.airconF.outdoorHumidity=e.target.value;ohFg.appendChild(ohi);wg.appendChild(ohFg);c.appendChild(wg);
     const ofi=Inp('',{type:'number',inputmode:'decimal',value:S.airconF.outdoorFeels||''});ofi.oninput=e=>S.airconF.outdoorFeels=e.target.value;c.appendChild(Fg('Feels Like (C)',ofi,'Outdoor temp affects running kWh lightly. Values auto-fill from Open-Meteo when available.'));
     c.appendChild(h('p',{style:'font-size:11px;color:#8a7260;line-height:1.5;margin-bottom:10px'},`Uses your editable config rates. After the first ${durationLabel(60)}, the estimate switches by mode and day/night time.`));
-    const ca=Btn('bg','Cancel',()=>set({modal:null}));ca.style.flex='1';const sa=Btn('bp','Log Usage',addAircon);sa.style.flex='2';c.appendChild(Mr(ca,sa));return M('Log Aircon Usage',c);
+    const ca=Btn('bg','Cancel',()=>set({modal:null}));ca.style.flex='1';
+    const st=Btn('bg','Start Timer',()=>{startActiveSession('aircon',{mode:S.airconF.mode,sleepMode:S.airconF.sleepMode,tempC:S.airconF.tempC,roomTemp:S.airconF.roomTemp,outdoorTemp:S.airconF.outdoorTemp,outdoorFeels:S.airconF.outdoorFeels,outdoorHumidity:S.airconF.outdoorHumidity});set({modal:null});});st.style.flex='1.4';
+    const sa=Btn('bp','Log Usage',addAircon);sa.style.flex='1.6';c.appendChild(Mr(ca,st,sa));return M('Log Aircon Usage',c);
   }
   if(S.modal==='addTv'){
     const c=D('');
@@ -2397,7 +2729,7 @@ function render(){
   openSw=null;
   const root=document.getElementById('app');root.innerHTML='';
   root.style.background='#f7f3ee';
-  const app=D('');app.style.cssText='max-width:480px;margin:0 auto;height:100vh;height:100dvh;background:#f7f3ee;display:flex;flex-direction:column;overflow:hidden';
+  const app=D('');app.style.cssText='width:100%;height:100%;background:#f7f3ee;display:flex;flex-direction:column;overflow:hidden';
   // Close swipe on tap outside
   app.addEventListener('touchstart',e=>{if(openSw&&!openSw.contains(e.target)){const c=openSw.querySelector('.swc');if(c){c.style.transition='transform .15s ease';c.style.transform='';}openSw=null;}},{passive:true});
   // Drawer
