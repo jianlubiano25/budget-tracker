@@ -304,13 +304,13 @@ function electricityComparisonForMonth(monthKey,data=S?.data,actualKwh=0){
   return{cycle,est,loggedKwh,diff:actualKwh?Math.abs(est.totalKwh-actualKwh):0};
 }
 function electricityReportForMonth(monthKey=curMk(),data=S?.data){
-  const rate=parseFloat(data?.meralcoRate)||14.3345;
-  const aircon=(data?.airconUsage||[]).filter(u=>mk(u.date)===monthKey);
-  const tv=(data?.tvUsage||[]).filter(u=>mk(u.date)===monthKey);
-  const sessions=(data?.applianceUsage||[]).filter(u=>mk(u.date)===monthKey);
+  const rate=parseFloat(data?.meralcoRate)||14.3345,cycle=billCycleForMonth(monthKey,meralcoReadDay(data)),cycleDayCount=cycleDays(cycle);
+  const aircon=(data?.airconUsage||[]).filter(u=>inCycle(u,cycle));
+  const tv=(data?.tvUsage||[]).filter(u=>inCycle(u,cycle));
+  const sessions=(data?.applianceUsage||[]).filter(u=>inCycle(u,cycle));
   const always=(data?.appliances||[]).filter(a=>a.alwaysOn).map(a=>{
     const est=applianceMonthly(a,rate);
-    return{name:a.name,category:a.category||'24/7',kwh:est.kwh,cost:est.cost,hours:720,logs:0,type:'24/7'};
+    return{name:a.name,category:a.category||'24/7',kwh:est.kwh/30*cycleDayCount,cost:est.cost/30*cycleDayCount,hours:cycleDayCount*24,logs:0,type:'24/7'};
   });
   const airconKwh=aircon.reduce((s,u)=>s+(parseFloat(u.kwh)||0),0),airconCost=aircon.reduce((s,u)=>s+(parseFloat(u.cost)||0),0),airconHours=aircon.reduce((s,u)=>s+(parseFloat(u.hours)||parseFloat(u.minutes)/60||0),0);
   const tvKwh=tv.reduce((s,u)=>s+(parseFloat(u.kwh)||0),0),tvCost=tv.reduce((s,u)=>s+(parseFloat(u.cost)||0),0),tvHours=tv.reduce((s,u)=>s+(parseFloat(u.hours)||parseFloat(u.minutes)/60||0),0);
@@ -332,8 +332,8 @@ function electricityReportForMonth(monthKey=curMk(),data=S?.data){
     ...tv.map(u=>({type:'TV',name:durationLabel(u.minutes||(u.hours||0)*60),date:u.date,time:u.start&&u.end?`${fmtTime12(u.start)}-${fmtTime12(u.end)}`:'',kwh:u.kwh,cost:u.cost})),
     ...sessions.map(u=>({type:'Appliance',name:`${u.name} · ${durationLabel(u.minutes)}`,date:u.date,time:u.start&&u.end?`${fmtTime12(u.start)}-${fmtTime12(u.end)}`:'',kwh:u.kwh,cost:u.cost}))
   ].sort((a,b)=>b.date.localeCompare(a.date)||String(b.time).localeCompare(String(a.time)));
-  const [y,m]=monthKey.split('-').map(Number),days=daysInMonth(y,m-1),totalKwh=airconKwh+tvKwh+sessionKwh+alwaysKwh,totalCost=airconCost+tvCost+sessionCost+alwaysCost;
-  return{monthKey,days,aircon,tv,sessions,always,logs,top,airconKwh,airconCost,airconHours,tvKwh,tvCost,tvHours,sessionKwh,sessionCost,sessionHours,alwaysKwh,alwaysCost,totalKwh,totalCost,rate};
+  const totalKwh=airconKwh+tvKwh+sessionKwh+alwaysKwh,totalCost=airconCost+tvCost+sessionCost+alwaysCost;
+  return{monthKey,cycle,days:cycleDayCount,aircon,tv,sessions,always,logs,top,airconKwh,airconCost,airconHours,tvKwh,tvCost,tvHours,sessionKwh,sessionCost,sessionHours,alwaysKwh,alwaysCost,totalKwh,totalCost,rate};
 }
 function weatherSettings(data=S?.data){
   return{
@@ -1587,10 +1587,11 @@ function renderReports(){
   const billsTotal=data.bills.reduce((s,b)=>s+(b.monthlyAmounts[rm]||0),0);
   const foodTotal=foodTx.reduce((s,t)=>s+t.amount,0);
   const homeTotal=homeEx.reduce((s,e)=>s+e.amount,0);
-  const airconTotal=airconUsage.reduce((s,u)=>s+u.cost,0);
-  const tvTotal=tvUsage.reduce((s,u)=>s+u.cost,0);
-  const applianceTotal=appliances.reduce((s,a)=>s+applianceMonthly(a,data.meralcoRate).cost,0)+applianceUsage.reduce((s,u)=>s+u.cost,0);
-  const electricityTotal=airconTotal+tvTotal+applianceTotal;
+  const electricReport=electricityReportForMonth(rm,data);
+  const airconTotal=electricReport.airconCost;
+  const tvTotal=electricReport.tvCost;
+  const applianceTotal=electricReport.sessionCost+electricReport.alwaysCost;
+  const electricityTotal=electricReport.totalCost;
   const grandTotal=foodTotal+homeTotal+billsTotal; // Exclude aircon as it's part of the bills
   // Hero card
   const hero=D('card cg');hero.style.marginBottom='9px';
@@ -2260,6 +2261,7 @@ function renderModal(){
     const prev=Btn('bgsm','<',()=>set({chartMonthKey:shiftMonthKey(monthKey,-1)}));prev.style.width='36px';
     const next=Btn('bgsm','>',()=>set({chartMonthKey:shiftMonthKey(monthKey,1)}));next.style.width='36px';
     nav.appendChild(prev);nav.appendChild(h('div',{cls:'sf',style:'font-size:16px;flex:1;text-align:center;color:#3a2818'},mklbl(monthKey)));nav.appendChild(next);c.appendChild(nav);
+    c.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260;text-align:center;margin:-4px 0 9px'},`Meralco cycle ${cycleLabel(r.cycle)}`));
     const hero=D('');hero.style.cssText='background:#f7f3ee;border:1px solid #e2d9ce;border-radius:8px;padding:9px 10px;margin-bottom:8px';
     hero.appendChild(h('div',{cls:'lbl'},'Usage Overview'));
     hero.appendChild(h('div',{cls:'sf',style:'font-size:24px;color:#3a2818;margin-top:2px'},`${r.totalKwh.toFixed(2)} kWh`));
