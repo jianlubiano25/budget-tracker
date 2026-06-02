@@ -289,10 +289,54 @@ function weatherSettings(data=S?.data){
 function weatherSummary(w=S?.data?.weather){
   if(!w)return 'Weather not loaded';
   const parts=[];
+  const codeLabel=weatherCodeLabel(w.code);
   if(w.temp!=null)parts.push(`Outdoor ${Number(w.temp).toFixed(1)}C`);
+  if(codeLabel)parts.push(codeLabel);
   if(w.apparent!=null)parts.push(`Feels ${Number(w.apparent).toFixed(1)}C`);
   if(w.humidity!=null)parts.push(`Humidity ${Math.round(w.humidity)}%`);
+  if(w.time)parts.push(`Updated ${fmtTime12(String(w.time).slice(11,16))}`);
   return parts.join(' · ')||'Weather not loaded';
+}
+function weatherCodeLabel(code){
+  const c=Number(code);
+  if(c===0)return 'Clear';
+  if([1,2,3].includes(c))return ['Mainly clear','Partly cloudy','Overcast'][c-1];
+  if([45,48].includes(c))return 'Fog';
+  if([51,53,55].includes(c))return 'Drizzle';
+  if([56,57].includes(c))return 'Freezing drizzle';
+  if([61,63,65].includes(c))return 'Rain';
+  if([66,67].includes(c))return 'Freezing rain';
+  if([71,73,75,77].includes(c))return 'Snow';
+  if([80,81,82].includes(c))return 'Rain showers';
+  if([85,86].includes(c))return 'Snow showers';
+  if([95,96,99].includes(c))return 'Thunderstorm';
+  return '';
+}
+function weatherVisualType(code){
+  const c=Number(code);
+  if([45,48].includes(c))return 'fog';
+  if([95,96,99].includes(c))return 'storm';
+  if([51,53,55,56,57,61,63,65,66,67,80,81,82,95,96,99].includes(c))return 'rain';
+  if([71,73,75,77,85,86].includes(c))return 'snow';
+  if([1,2,3].includes(c))return 'cloud';
+  return 'clear';
+}
+function weatherVisual(w){
+  const wrap=D(`wv ${weatherVisualType(w?.code)}`);
+  wrap.setAttribute('aria-hidden','true');
+  wrap.innerHTML='<div class="wv-glow"></div><div class="wv-sun"><span></span></div><div class="wv-cloud wv-cloud-a"></div><div class="wv-cloud wv-cloud-b"></div><div class="wv-rain wv-rain-a"></div><div class="wv-rain wv-rain-b"></div><div class="wv-rain wv-rain-c"></div><div class="wv-rain wv-rain-d"></div><div class="wv-bolt"></div><div class="wv-fog wv-fog-a"></div><div class="wv-fog wv-fog-b"></div><div class="wv-fog wv-fog-c"></div>';
+  return wrap;
+}
+function renderWeatherCard(data=S.data,{title='Weather'}={}){
+  const w=data.weather,ws=weatherSettings(data);
+  const card=D('card weather-card'),body=D('cp weather-body'),copy=D('weather-copy'),art=D('weather-art');
+  copy.appendChild(h('div',{cls:'lbl'},`${title} · ${ws.label}`));
+  copy.appendChild(h('div',{cls:'sf weather-temp'},w?.temp!=null?`${Number(w.temp).toFixed(1)}C`:'--'));
+  copy.appendChild(h('div',{cls:'weather-meta'},`${w?weatherSummary(w):(S.weatherLoading?'Loading Open-Meteo...':'Open-Meteo not loaded yet')}${S.weatherErr?' · '+S.weatherErr:''}`));
+  art.appendChild(weatherVisual(w));
+  art.appendChild(Btn('bgsm weather-refresh','Refresh',()=>updateWeather(true)));
+  body.appendChild(art);body.appendChild(copy);card.appendChild(body);
+  return card;
 }
 function weatherStale(data=S?.data){
   const t=Date.parse(data?.weather?.fetchedAt||'');
@@ -403,7 +447,7 @@ async function updateWeather(force=false){
     const res=await fetch(url);
     if(!res.ok)throw new Error('Weather request failed');
     const json=await res.json(),cur=json.current||{};
-    const weather={source:'Open-Meteo',label:ws.label,lat:ws.lat,lon:ws.lon,elevation:ws.elevation,temp:cur.temperature_2m,humidity:cur.relative_humidity_2m,apparent:cur.apparent_temperature,wind:cur.wind_speed_10m,code:cur.weather_code,time:cur.time,fetchedAt:new Date().toISOString()};
+    const weather={source:'Open-Meteo',label:ws.label,lat:ws.lat,lon:ws.lon,modelLat:json.latitude,modelLon:json.longitude,elevation:json.elevation??ws.elevation,temp:cur.temperature_2m,humidity:cur.relative_humidity_2m,apparent:cur.apparent_temperature,wind:cur.wind_speed_10m,code:cur.weather_code,time:cur.time,fetchedAt:new Date().toISOString()};
     S.weatherLoading=false;S.weatherErr='';
     setD(d=>({...d,weather}));
   }catch(e){
@@ -1083,10 +1127,7 @@ function renderDash(){
   const c1=D('card');c1.innerHTML=`<div class="cp"><div class="lbl">Today's Meals</div><div class="sf" style="font-size:23px;color:${ob?'#b83030':'#3a2818'};margin:2px 0">${fmt(todayS)}</div><div style="font-size:10.5px;color:#8a7260">Daily: ${fmt(data.dailyBudget)} · Monthly: ${fmt(data.dailyBudget*30)}</div>${ob?'<div style="font-size:10px;color:#b83030;font-weight:700;margin-top:1px">⚠️ Over budget</div>':''}</div>`;
   const c2=D('card');c2.innerHTML=`<div class="cp"><div class="lbl">Groceries This Month</div><div class="sf" style="font-size:23px;color:${groceryMonth>(data.groceryBudget||5000)?'#b83030':'#3a2818'};margin:2px 0">${fmt(groceryMonth)}</div><div style="font-size:10.5px;color:#8a7260">Monthly budget: ${fmt(data.groceryBudget||5000)}</div></div>`;
   g2.appendChild(c1);g2.appendChild(c2);sec.appendChild(g2);
-  const w=data.weather,ws=weatherSettings(data);
-  const wc=D('card');wc.innerHTML=`<div class="cp"><div class="row"><div><div class="lbl">Weather · ${ws.label}</div><div class="sf" style="font-size:22px;margin:2px 0">${w?.temp!=null?Number(w.temp).toFixed(1)+'C':'--'}</div><div style="font-size:10.5px;color:#8a7260">${w?weatherSummary(w):(S.weatherLoading?'Loading Open-Meteo...':'Open-Meteo not loaded yet')}${S.weatherErr?' · '+S.weatherErr:''}</div></div><button class="btn bgsm" id="refreshWeatherDash">Refresh</button></div></div>`;
-  setTimeout(()=>{const b=document.getElementById('refreshWeatherDash');if(b)b.onclick=()=>updateWeather(true);},0);
-  sec.appendChild(wc);
+  sec.appendChild(renderWeatherCard(data,{title:'Weather'}));
   if (airconCost + tvCost + applianceCost > 0) {
     const acCard = D('card'); acCard.innerHTML = `<div class="cp"><div class="lbl">Electricity Cycle · ${cycleLabel(eCycle)}</div><div class="sf" style="font-size:23px;margin:2px 0">${fmt2(airconCost+tvCost+applianceCost)}</div><div style="font-size:10.5px;color:#8a7260">24/7 ${fmt2(cycleAlwaysOnCost)} · Sessions ${fmt2(applianceSessionCost)} · Aircon ${fmt2(airconCost)} · TV ${fmt2(tvCost)}</div></div>`;
     sec.appendChild(acCard);
@@ -1649,15 +1690,7 @@ function renderAircon(){
   const hero=D('card cg');hero.innerHTML=`<div class="cp"><div class="lblw">${cycleLabel(selectedCycle)} Est. Electricity</div><div class="sf" style="font-size:32px;color:#fff;margin:2px 0">${fmt2(mCost+tvCost+applianceCost)}</div><div style="font-size:11px;color:rgba(255,255,255,.55)">Total ${displayCycleKwh.toFixed(2)} kWh${meralcoCycleKwh?' Meralco':' estimated'} · Read day ${readDay} · 24/7 ${fmt2(alwaysOnCost)} · Sessions ${fmt2(applianceSessionCost)} · Aircon ${durationLabel(mHours*60)} · TV ${durationLabel(tvHours*60)}</div></div>`;
   sec.appendChild(hero);
 
-  const weatherCard=D('card');
-  const weatherBody=D('cp');
-  const wr=D('row');wr.style.cssText='gap:9px';
-  const wl=D('');wl.style.cssText='flex:1;min-width:0';
-  wl.appendChild(h('div',{cls:'lbl'},`Outdoor Weather · ${weatherSettings(data).label}`));
-  wl.appendChild(h('div',{cls:'sf',style:'font-size:22px;margin:2px 0'},data.weather?.temp!=null?`${Number(data.weather.temp).toFixed(1)}C`:'--'));
-  wl.appendChild(h('div',{style:'font-size:10.5px;color:#8a7260'},data.weather?weatherSummary(data.weather):(S.weatherLoading?'Loading Open-Meteo...':'Open-Meteo not loaded yet')));
-  const wb=Btn('bgsm','Refresh',()=>updateWeather(true));wb.style.flexShrink='0';
-  wr.appendChild(wl);wr.appendChild(wb);weatherBody.appendChild(wr);weatherCard.appendChild(weatherBody);sec.appendChild(weatherCard);
+  sec.appendChild(renderWeatherCard(data,{title:'Outdoor Weather'}));
 
   const stats=D('g2');stats.style.marginBottom='9px';
   const s1=D('card');s1.innerHTML=`<div class="cp"><div class="lbl">Always On</div><div class="sf" style="font-size:21px;margin:2px 0">${fmt2(alwaysOnCost)}</div><div style="font-size:10.5px;color:#8a7260">${alwaysOnKwh.toFixed(3)} kWh/cycle</div></div>`;
